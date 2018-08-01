@@ -1,0 +1,21 @@
+[[override]]
+  name = "k8s.io/api"
+  version = "kubernetes-1.9.0"
+
+[[override]]
+  name = "k8s.io/apimachinery"
+  version = "kubernetes-1.9.0"
+
+[[override]]
+  name = "k8s.io/client-go"
+  version = "6.0.0"
+
+[[override]]
+  name = "github.com/cloudflare/cfssl"
+[[constraint]]
+  name = "k8s.io/kubernetes"
+  version = "1.11.1"
+
+[[constraint]]
+  name = "github.com/ghodss/yaml"
+  version = "1.0.0"
