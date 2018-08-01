@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,12 +14,17 @@ import (
 
 	"encoding/json"
 	"encoding/pem"
+	"io/ioutil"
 
-	"github.com/ghodss/yaml"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/minikube/pkg/util/kubeconfig"
+
+	// "k8s.io/kops/pkg/kubeconfig"
+
+	"github.com/gorilla/mux"
 )
 
 var clusterName string
@@ -28,7 +33,7 @@ func init() {
 	clusterName = os.Getenv("CLUSTER_NAME")
 }
 
-func genCsr(namespace string, username string) (string, string) {
+func genCsr(namespace string, username string) ([]byte, []byte) {
 
 	name := csr.Name{
 		C:  "US",
@@ -48,14 +53,123 @@ func genCsr(namespace string, username string) (string, string) {
 		KeyRequest: keyRequest,
 	}
 
-	csr, keys, _ := csr.ParseRequest(&csrq)
+	csr, key, _ := csr.ParseRequest(&csrq)
 	// fmt.Println(string(csr[:]))
-	// fmt.Println(string(keys[:]))
-	return string(csr[:]), string(keys[:])
+	// fmt.Println(string(key[:]))
+	return csr, key
 }
 
-// func kcreateCertificate() {
+func createCertificate(user, namespace string, request []byte, clientset *kubernetes.Clientset) *v1beta1.CertificateSigningRequest {
 
+	csrClient := clientset.CertificatesV1beta1().CertificateSigningRequests()
+	csr := &v1beta1.CertificateSigningRequest{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "CertificateSigningRequest",
+			APIVersion: "certificates.k8s.io/v1beta1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: user,
+		},
+		Spec: v1beta1.CertificateSigningRequestSpec{
+			Request: request,
+			Usages:  []v1beta1.KeyUsage{v1beta1.UsageKeyEncipherment, v1beta1.UsageDigitalSignature},
+		},
+	}
+
+	kcsr, errcsr := csrClient.Create(csr)
+
+	if errcsr != nil {
+		log.Fatal(errcsr)
+	}
+
+	kcsr.Status.Conditions = append(kcsr.Status.Conditions, v1beta1.CertificateSigningRequestCondition{Type: v1beta1.CertificateApproved})
+	csrClient.UpdateApproval(kcsr)
+
+	resultCsr, _ := csrClient.Get(user, metav1.GetOptions{})
+	return resultCsr
+}
+
+func createKubeConfig(user, namespace string, privateKey, certificateAuthorityData, certificate []byte) string {
+
+	newconfig := api.NewConfig()
+	newconfig.Kind = "Config"
+	newconfig.APIVersion = "v1"
+
+	newconfig.Clusters[user] = &api.Cluster{
+		Server:                   "https://x.x.x.x:6443",
+		InsecureSkipTLSVerify:    false,
+		CertificateAuthorityData: certificateAuthorityData,
+	}
+
+	newcontextName := fmt.Sprintf("%s-%s", user, "context")
+
+	newconfig.Contexts[newcontextName] = &api.Context{
+		Cluster:   user,
+		AuthInfo:  user,
+		Namespace: namespace,
+	}
+
+	newconfig.AuthInfos[user] = &api.AuthInfo{
+		ClientKeyData:         privateKey,
+		ClientCertificateData: certificate,
+	}
+
+	newconfig.CurrentContext = newcontextName
+
+	// serConfigJson, _ := json.Marshal(newconfig)
+	// serConfig, _ := yaml.JSONToYAML(serConfigJson)
+	// print(string(serConfig))
+
+	// f, _ := os.Create("/tmp/kube.config")
+	// defer f.Close()
+
+	// w := bufio.NewWriter(f)
+	// w.WriteString(string(serConfig))
+	// w.Flush()
+
+	file, _ := ioutil.TempFile(os.TempDir(), "kubeconfig")
+	defer os.Remove(file.Name())
+
+	fmt.Printf("temp file is %s\n", file.Name())
+
+	kubeconfig.WriteConfig(newconfig, file.Name())
+	content, _ := ioutil.ReadFile(file.Name())
+	return string(content)
+}
+
+// func createKubeConfigV2(user, namespace string, privateKey, certificateAuthorityData, certificate []byte) {
+// 	kubeconfig.KubectlConfig{
+// 		Kind:           "Config",
+// 		ApiVersion:     "v1",
+// 		CurrentContext: fmt.Sprintf("%s-%s", user, "context"),
+// 		Clusters: []kubeconfig.KubectlClusterWithName{
+// 			kubeconfig.KubectlClusterWithName{
+// 				Name:    "kubernetes",
+// 				Cluster: kubeconfig.KubectlCluster{
+// 					Server: "https://35.230.27.214:6443",
+// 					CertificateAuthorityData: certificateAuthorityData,
+// 				},
+// 			},
+// 		},
+// 		Contexts: []kubeconfig.KubectlContextWithName{
+// 			kubeconfig.KubectlContextWithName{
+// 				Name: fmt.Sprintf("%s-%s", user, "context"),
+// 				Context: kubeconfig.KubectlContext{
+// 					Cluster: "kubernetes",
+// 					User: user,
+// 				},
+// 			},
+// 		},
+// 		Users: []kubeconfig.KubectlUserWithName{
+// 			kubeconfig.KubectlUserWithName{
+// 				Name: user,
+// 				User: kubeconfig.KubectlUser{
+// 					ClientCertificateData: certificate,
+// 					ClientKeyData: privateKey,
+// 				},
+// 			},
+// 		}
+// 	}
 // }
 
 func createNamespace(clientset *kubernetes.Clientset, name string) {
@@ -102,10 +216,12 @@ func pemEncodeData(data []byte) (result string) {
 	return
 }
 
-func main() {
+func orchestrate(namespace string) string {
 	// fmt.Println("Hello world")
-	user := "hello10"
-	namespace := "hello10"
+	// user := "hello10"
+	// namespace := "hello10"
+
+	user := namespace
 
 	kubeconfig := filepath.Join(
 		os.Getenv("HOME"), ".kube", "config",
@@ -118,87 +234,37 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// bdata, _ := json.Marshal(config.TLSClientConfig)
-	// fmt.Println(string(bdata[:]))
-
-	fmt.Println("---------------------------------")
-
 	request, key := genCsr(namespace, user)
-	// encodedRequest :=[]byte(base64.StdEncoding.EncodeToString([]byte(request)))
+	resultCsr := createCertificate(user, namespace, request, clientset)
+	return createKubeConfig(user, namespace, key, config.TLSClientConfig.CAData, resultCsr.Status.Certificate)
 
-	csrClient := clientset.CertificatesV1beta1().CertificateSigningRequests()
-	csr := &v1beta1.CertificateSigningRequest{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "CertificateSigningRequest",
-			APIVersion: "certificates.k8s.io/v1beta1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: user,
-		},
-		Spec: v1beta1.CertificateSigningRequestSpec{
-			Request: []byte(request),
-			Usages:  []v1beta1.KeyUsage{v1beta1.UsageKeyEncipherment, v1beta1.UsageDigitalSignature},
-		},
-	}
-
-	kcsr, errcsr := csrClient.Create(csr)
-
-	if errcsr != nil {
-		log.Fatal(errcsr)
-	}
-
-	kcsr.Status.Conditions = append(kcsr.Status.Conditions, v1beta1.CertificateSigningRequestCondition{Type: v1beta1.CertificateApproved})
-
-	// certCsr, _ :=
-	csrClient.UpdateApproval(kcsr)
-	// fmt.Println(certCsr.Status)
-	// fmt.Println(string(key[:]))
-
-	resultCsr, _ := csrClient.Get(user, metav1.GetOptions{})
-	// block := &pem.Block{Bytes: resultCsr.Status.Certificate}
-
-	// certificate := pemEncodeData(resultCsr.Status.Certificate)
-
-	newconfig := api.NewConfig()
-	newconfig.Kind = "Config"
-	newconfig.APIVersion = "v1"
-
-	newconfig.Clusters[user] = &api.Cluster{
-		Server:                   "https://35.230.27.214:6443",
-		InsecureSkipTLSVerify:    false,
-		CertificateAuthorityData: config.TLSClientConfig.CAData,
-	}
-
-	newcontextName := fmt.Sprintf("%s-%s", user, "context")
-
-	newconfig.Contexts[newcontextName] = &api.Context{
-		Cluster:   user,
-		AuthInfo:  user,
-		Namespace: namespace,
-	}
-
-	newconfig.AuthInfos[user] = &api.AuthInfo{
-		ClientKeyData:         []byte(key),
-		ClientCertificateData: []byte(resultCsr.Status.Certificate),
-	}
-
-	newconfig.CurrentContext = newcontextName
-
-	serConfigJson, _ := json.Marshal(newconfig)
-	serConfig, _ := yaml.JSONToYAML(serConfigJson)
-	print(string(serConfig))
-
-	f, _ := os.Create("/tmp/kube.config")
-	defer f.Close()
-
-	w := bufio.NewWriter(f)
-	w.WriteString(string(serConfig))
-	w.Flush()
-
-	// fmt.Println(time.Now())
 	// listPods(clientset)
 	// listNodes(clientset)
-
 	// clientset.CoreV1().Nodes().List(metav1.ListOptions{})
 
+}
+
+type RegisterSpec struct {
+	ASV string `json:"asv, omitempty"`
+	ENV string `json:"env"`
+	BAP string `json:"bap, omitempty"`
+}
+
+func Register(w http.ResponseWriter, r *http.Request) {
+	// params := mux.Vars(r)
+	var registerSpec RegisterSpec
+	json.NewDecoder(r.Body).Decode(&registerSpec)
+
+	data, _ := json.Marshal(registerSpec)
+	fmt.Println(string(data))
+
+	result := orchestrate(registerSpec.ENV)
+
+	json.NewEncoder(w).Encode(result)
+}
+
+func main() {
+	router := mux.NewRouter()
+	router.HandleFunc("/system/register", Register).Methods("POST")
+	log.Fatal(http.ListenAndServe(":8000", router))
 }
